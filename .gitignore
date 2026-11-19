@@ -1,0 +1,7 @@
+sample_data/
+*.txm
+*.txrm
+*.xrm
+__pycache__/
+*.egg-info/
+.pytest_cache/

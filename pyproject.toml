@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xradia-reader"
+version = "0.1.0"
+description = "Read Zeiss Xradia .xrm/.txrm/.txm files with full metadata"
+requires-python = ">=3.9"
+dependencies = ["numpy", "olefile", "h5py"]
+
+[project.optional-dependencies]
+tiff = ["tifffile"]
+test = ["pytest", "tifffile"]
+
+[project.scripts]
+xradia-info = "xradia_reader.cli:main"
+xradia-archive = "xradia_reader.cli:archive_main"
+
+[tool.setuptools]
+packages = ["xradia_reader"]
