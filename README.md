@@ -140,3 +140,7 @@ largest change are recorded in the attributes of `/data`.
 
 `python -m pytest tests` (15 tests; the sample-file tests are skipped when
 `sample_data/` is missing; the data are git-ignored).
+
+## License
+
+MIT. See [LICENSE](LICENSE). Copyright (c) 2026 MATES Lab, Universidad de Sevilla-CSIC.

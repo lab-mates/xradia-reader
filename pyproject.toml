@@ -7,6 +7,7 @@ name = "xradia-reader"
 version = "0.1.0"
 description = "Read Zeiss Xradia .xrm/.txrm/.txm files with full metadata"
 requires-python = ">=3.9"
+license = { text = "MIT" }
 dependencies = ["numpy", "olefile", "h5py"]
 
 [project.optional-dependencies]
