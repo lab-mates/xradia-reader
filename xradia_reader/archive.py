@@ -4,19 +4,32 @@ Only stock HDF5 filters are used (byte *shuffle* + *gzip/deflate*), which every
 libhdf5 build since the 1990s decodes -- h5py, MATLAB ``h5read``, Fiji HDF5
 import, HDFView, Avizo, Dragonfly... No plugins are needed to read the files.
 
-Layout (format "xradia-archive", version 1)::
+Layout (format "xradia-archive", version 3)::
 
     /data            stored dtype (uint16 for Versa reconstructions), shape
                      (n, h, w), one chunk per image, shuffle + gzip
         attrs: element_size_um [z, y, x], unit, axes, drop_bits,
                quantization_step, noise_sigma_estimate, pixel_sha256,
-               source_pixel_sha256
+               source_pixel_sha256, and ImageJ calibration (pixelWidth,
+               pixelHeight, pixelDepth, pixelUnit="um", numSlices...)
     /reference       flat-field reference (projection files only)
-    /summary         JSON text of XradiaFile.summary
-    /metadata/...    decoded metadata tree (groups mirror the OLE storages)
-    /raw_streams/... raw bytes of every non-pixel OLE stream (uint8)
+    /summary         empty group; its attributes hold the key values
+                     (voxel size, kV, uA, filter, objective, distances...)
+    /metadata        uint8: UTF-8 JSON (gzip filter) with "summary" (the full
+                     curated summary) and "tree" (every decoded stream)
+    /raw_streams     uint8: UTF-8 JSON (gzip filter), {stream path: base64 of
+                     the raw bytes} for every non-pixel OLE stream
     / attrs          format, format_version, source_file, source_size,
                      source_sha256, created, kind, writer
+
+In the JSON, arrays are ``{"__ndarray__": dtype, "shape": [...], "base64":
+raw little-endian bytes}`` and byte strings ``{"__bytes__": base64}``; read
+them with ``json.loads(bytes(f["metadata"][()]))``.  Metadata is packed into
+two datasets so that Fiji's HDF5 import lists only a handful of entries.
+
+Older archives are still read; :func:`upgrade_archive` converts them without
+recompressing the pixels (version 1: one dataset per metadata stream;
+version 2: no ImageJ attributes).
 
 ``drop_bits=k`` (opt-in) rounds integer values to the nearest multiple of 2**k
 before compression ("near-lossless"); zeros (outside the reconstructed field of
@@ -25,9 +38,11 @@ statistically invisible but compression improves a lot (see README).
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
+import shutil
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -38,11 +53,13 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .reader import ImageStack, XradiaFile, _is_pixel_stream, _json_default
+from .reader import ImageStack, XradiaFile, _get as _get_path, _is_pixel_stream, _json_default, key_values
 
 FORMAT = "xradia-archive"
-FORMAT_VERSION = 1
-_STR = h5py.string_dtype("utf-8")
+FORMAT_VERSION = 3
+
+#: ImagePlus type codes used by the ImageJ attributes on /data.
+_IJ_TYPE = {np.dtype("u1"): 0, np.dtype("<u2"): 1, np.dtype("<f4"): 2}
 
 
 # ---------------------------------------------------------------------------
@@ -105,41 +122,59 @@ def _sha256_file(path, bufsize=16 << 20) -> str:
 
 
 # ---------------------------------------------------------------------------
-# metadata tree <-> HDF5
+# metadata <-> HDF5
 # ---------------------------------------------------------------------------
-def _put(group: h5py.Group, name: str, v):
-    big = dict(compression="gzip", compression_opts=4, shuffle=True)
-    if v is None:
-        ds = group.create_dataset(name, data=h5py.Empty("u1"))
-        ds.attrs["py_type"] = "none"
-    elif isinstance(v, bytes):
-        a = np.frombuffer(v, np.uint8)
-        ds = group.create_dataset(name, data=a, **(big if a.size > 1024 else {}))
-        ds.attrs["py_type"] = "bytes"
-    elif isinstance(v, str):
-        group.create_dataset(name, data=v, dtype=_STR)
-    elif isinstance(v, list):
-        ds = group.create_dataset(name, data=[str(x) for x in v], dtype=_STR)
-        ds.attrs["py_type"] = "list"
-    elif isinstance(v, np.ndarray):
-        group.create_dataset(name, data=v, **(big if v.nbytes > 1024 else {}))
-    elif isinstance(v, (bool, np.bool_)):
-        ds = group.create_dataset(name, data=np.uint8(v))
-        ds.attrs["py_type"] = "bool"
-    elif isinstance(v, (int, float, np.integer, np.floating)):
-        group.create_dataset(name, data=v)
-    else:
-        raise TypeError(f"cannot store {type(v)} at {group.name}/{name}")
+def _json_enc(o):
+    if isinstance(o, np.ndarray):
+        return {"__ndarray__": o.dtype.str, "shape": list(o.shape),
+                "base64": base64.b64encode(np.ascontiguousarray(o).tobytes()).decode()}
+    if isinstance(o, bytes):
+        return {"__bytes__": base64.b64encode(o).decode()}
+    return _json_default(o)
 
 
-def _write_tree(group: h5py.Group, tree: dict):
-    for k, v in tree.items():
-        if isinstance(v, dict):
-            _write_tree(group.create_group(k), v)
-        else:
-            _put(group, k, v)
+def _json_hook(d):
+    if "__ndarray__" in d:
+        return np.frombuffer(base64.b64decode(d["base64"]), np.dtype(d["__ndarray__"])) \
+            .reshape(d["shape"]).copy()
+    if "__bytes__" in d:
+        return base64.b64decode(d["__bytes__"])
+    return d
 
 
+def _put_json(f: h5py.File, name: str, obj, **attrs):
+    b = json.dumps(obj, default=_json_enc, separators=(",", ":")).encode()
+    ds = f.create_dataset(name, data=np.frombuffer(b, np.uint8),
+                          chunks=(min(len(b), 1 << 20),) if b else None,
+                          compression="gzip" if b else None, compression_opts=9 if b else None)
+    ds.attrs.update({"content": "UTF-8 JSON", **attrs})
+
+
+def _get_json(ds: h5py.Dataset):
+    return json.loads(ds[()].tobytes(), object_hook=_json_hook)
+
+
+def _write_key_values(f: h5py.File, summary: dict):
+    g = f.create_group("summary", track_order=True)
+    for k, v in key_values(summary).items():
+        g.attrs[k] = v if isinstance(v, (int, float, bool, np.number)) else str(v)
+
+
+def _write_imagej_attrs(d: h5py.Dataset, title: str):
+    """ImageJ calibration attributes on /data, read by Fiji's
+    File > Import > HDF5/N5/Zarr/OME-NGFF (n5-ij "ImageJ" metadata), which
+    then shows the unit as um.  The older File > Import > HDF5 (HDF5_Vibez)
+    reads only element_size_um and always labels it "micrometer"."""
+    dz, dy, dx = (float(v) for v in d.attrs["element_size_um"])
+    d.attrs.update({
+        "title": title, "pixelWidth": dx, "pixelHeight": dy, "pixelDepth": dz,
+        "pixelUnit": "um", "xOrigin": 0.0, "yOrigin": 0.0, "zOrigin": 0.0,
+        "numChannels": 1, "numSlices": int(d.shape[0]), "numFrames": 1,
+        "fps": 0.0, "frameInterval": 0.0, "type": _IJ_TYPE.get(d.dtype, 1),
+    })
+
+
+# version-1 layout: one dataset per stream
 def _get(ds: h5py.Dataset):
     t = ds.attrs.get("py_type")
     if t == "none":
@@ -219,6 +254,7 @@ def write_hdf5(xf: XradiaFile, path, drop_bits: int | str = 0, level: int = 4,
             "drop_bits": drop_bits, "quantization_step": 1 << drop_bits,
             "noise_sigma_estimate": sigma if sigma is not None else np.nan,
         })
+        _write_imagej_attrs(d, xf.path.stem)
         # Read images in the main thread (olefile is not thread safe),
         # compress in the pool, write chunks in order.
         batch = 2 * workers
@@ -241,17 +277,12 @@ def write_hdf5(xf: XradiaFile, path, drop_bits: int | str = 0, level: int = 4,
             f.create_dataset("reference", data=ref, chunks=ref.shape,
                              shuffle=True, compression="gzip", compression_opts=level)
 
-        f.create_dataset("summary", data=json.dumps(xf.summary, default=_json_default,
-                                                    indent=1), dtype=_STR)
-        _write_tree(f.create_group("metadata"), xf.metadata)
-        raw = f.create_group("raw_streams")
-        for parts in xf._ole.listdir(streams=True, storages=False):
-            if _is_pixel_stream(parts):
-                continue
-            g = raw
-            for p in parts[:-1]:
-                g = g.require_group(p)
-            _put(g, parts[-1], xf.raw("/".join(parts)))
+        summary = json.loads(json.dumps(xf.summary, default=_json_default))
+        _write_key_values(f, summary)
+        _put_json(f, "metadata", {"summary": summary, "tree": xf.metadata})
+        _put_json(f, "raw_streams", {
+            "/".join(p): xf.raw("/".join(p))
+            for p in xf._ole.listdir(streams=True, storages=False) if not _is_pixel_stream(p)})
         t_write = time.time() - t0
         if source_hash:
             f.attrs["source_sha256"] = _sha256_file(xf.path)
@@ -360,23 +391,97 @@ class ArchiveFile(ImageStack):
     def reference(self):
         return self._h5["reference"][()] if "reference" in self._h5 else None
 
-    @cached_property
-    def summary(self) -> dict:
-        return json.loads(self._h5["summary"].asstr()[()])
+    @property
+    def format_version(self) -> int:
+        return int(self._h5.attrs.get("format_version", 1))
 
     @cached_property
+    def _meta_doc(self) -> dict:
+        if self.format_version >= 2:
+            return _get_json(self._h5["metadata"])
+        return {"summary": json.loads(self._h5["summary"].asstr()[()]),
+                "tree": _read_tree(self._h5["metadata"])}
+
+    @property
+    def summary(self) -> dict:
+        return self._meta_doc["summary"]
+
+    @property
+    def key_values(self) -> dict:
+        """The important values (attributes of /summary in version 2)."""
+        if self.format_version >= 2:
+            return {k: (v.item() if isinstance(v, np.generic) else v)
+                    for k, v in self._h5["summary"].attrs.items()}
+        return key_values(self.summary)
+
+    @property
     def metadata(self) -> dict:
-        return _read_tree(self._h5["metadata"])
+        return self._meta_doc["tree"]
 
     def value(self, path, default=None):
-        g = self._h5["metadata"]
-        return _get(g[path]) if path in g else default
+        return _get_path(self.metadata, path, default)
+
+    @cached_property
+    def _raw(self) -> dict:
+        if self.format_version >= 2:
+            return _get_json(self._h5["raw_streams"])
+        out = {}
+        self._h5["raw_streams"].visititems(
+            lambda name, o: out.__setitem__(name, _get(o)) if isinstance(o, h5py.Dataset) else None)
+        return out
 
     def raw(self, path) -> bytes:
-        return _get(self._h5["raw_streams"][path])
+        return self._raw[path]
 
     def _global_minmax(self):
         return self.value("GlobalMinMax/GlobalMin"), self.value("GlobalMinMax/GlobalMax")
+
+
+def upgrade_archive(src, dst=None, verify: bool = True) -> dict:
+    """Bring an older archive to the current layout.
+
+    Version 2 only lacks the ImageJ attributes on /data; they are added in
+    place (or on a copy if ``dst`` is given).  Version 1 is rewritten; pixel
+    chunks are copied as they are (no recompression).  ``dst=None`` replaces
+    ``src``."""
+    src = Path(src)
+    dst = Path(dst) if dst else src
+    with ArchiveFile(src) as a:
+        version = a.format_version
+    if version >= FORMAT_VERSION and dst == src:
+        return {"archive": str(src), "upgraded": False}
+    stamp = {"format_version": FORMAT_VERSION,
+             "upgraded": datetime.now(timezone.utc).isoformat(),
+             "writer": "xradia_reader " + _version()}
+    if version == 2:
+        if dst != src:
+            shutil.copyfile(src, dst)
+        with h5py.File(dst, "r+") as f:
+            _write_imagej_attrs(f["data"], Path(str(f.attrs.get("source_file", dst.name))).stem)
+            f.attrs.update(stamp)
+        return {"archive": str(dst), "upgraded": True}
+
+    tmp = dst.with_name(dst.name + ".partial")
+    with ArchiveFile(src) as a:
+        old = a._h5
+        with h5py.File(tmp, "w") as f:
+            f.attrs.update(dict(old.attrs))
+            f.attrs.update(stamp)
+            for name in ("data", "reference"):
+                if name in old:
+                    old.copy(old[name], f, name)  # H5Ocopy: raw chunks
+            _write_imagej_attrs(f["data"], Path(str(old.attrs.get("source_file", dst.name))).stem)
+            _write_key_values(f, a.summary)
+            _put_json(f, "metadata", {"summary": a.summary, "tree": a.metadata})
+            _put_json(f, "raw_streams", a._raw)
+    report = {"archive": str(dst), "upgraded": True}
+    if verify:
+        report["verified"] = verify_hdf5(tmp)["ok"]
+        if not report["verified"]:
+            tmp.unlink()
+            return report
+    os.replace(tmp, dst)
+    return report
 
 
 def open_any(path) -> ImageStack:

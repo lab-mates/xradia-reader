@@ -37,7 +37,7 @@ Command line (`pip install -e .` provides `xradia-info` and `xradia-archive`, or
 `python -m xradia_reader.cli`):
 
 ```
-xradia-info scan.txm                      # summary
+xradia-info scan.txm                      # key values (--full for the whole summary)
 xradia-info scan.txm --tree --no-config   # every decoded stream
 xradia-info scan.txm --grep 'Recon|Filter'
 xradia-info scan.txm --json meta.json
@@ -83,12 +83,25 @@ xradia-archive --verify-only archive/*.h5           # re-check checksums later
 Each `.txm` becomes one `.h5` file holding:
 
 - **Pixels:** `/data`, in their original dtype.
-- **Voxel size:** `element_size_um` [z, y, x] attribute on `/data`.
-- **Metadata:** the full decoded tree in `/metadata`, plus the raw bytes of every
-  OLE metadata stream in `/raw_streams`, so nothing depends on the decoding
-  heuristics.
-- **Summary:** `/summary` as JSON.
+- **Voxel size:** `element_size_um` [z, y, x] attribute on `/data`, plus the
+  ImageJ calibration attributes used by Fiji's N5/HDF5 importer.
+- **Key values:** attributes of the `/summary` group, e.g. voxel size, kV, µA,
+  power, filter, objective, binning, source/detector distances, exposure,
+  number of projections and centre shift.
+- **Everything else:** `/metadata` holds the full curated summary and the
+  decoded tree. `/raw_streams` holds the raw bytes of every OLE metadata
+  stream, so nothing depends on the decoding heuristics. Each is one gzip-compressed UTF-8 JSON
+  dataset (arrays as base64), so Fiji's HDF5 import lists only a few
+  entries: `json.loads(bytes(f["metadata"][()]))`.
 - **Checksums:** SHA-256 of the pixels and of the original file.
+
+Older archives are still read. `xradia-archive --upgrade old/*.h5` brings
+them up to date in a few seconds and never recompresses the pixels:
+
+- Version 1 files (one HDF5 dataset per metadata stream, about 3900 entries)
+  are rewritten.
+- Version 2 files (no ImageJ attributes) only get the attributes added in
+  place.
 
 Every slice is read back and checked after writing.
 
@@ -106,6 +119,17 @@ with h5py.File("scan.h5") as f:
 ```matlab
 vol = h5read('scan.h5', '/data');          % MATLAB reverses axes: (x, y, z)
 ```
+
+**Fiji:** open archives with *File › Import › HDF5/N5/Zarr/OME-NGFF*. It
+reads ImageJ calibration attributes on `/data` (`pixelWidth`, `pixelHeight`,
+`pixelDepth`, `pixelUnit = "um"`, …) and shows the voxel size in µm. This was
+tested with Fiji's N5 plugins 4.4.1 and 5.0.0. The older *File › Import › HDF5...*
+(HDF5_Vibez) reads only `element_size_um` and always labels the unit
+"micrometer". That label is hard-coded in the plugin, so no file can change it.
+It also prints a harmless "Can't read attribute 'element_size_um'" warning
+for the two metadata datasets. If you prefer that importer,
+`fiji/Open_Xradia_Archive.ijm` loads `/data` with it and then sets the unit
+to `um`. Exported TIFFs already carry `unit=um`.
 
 With this package, `open_any("scan.h5")` gives the same API as `XradiaFile`,
 including `to_tiff()` for the Fiji workflow.
@@ -138,7 +162,7 @@ largest change are recorded in the attributes of `/data`.
 
 ## Tests
 
-`python -m pytest tests` (15 tests; the sample-file tests are skipped when
+`python -m pytest tests` (18 tests; the sample-file tests are skipped when
 `sample_data/` is missing; the data are git-ignored).
 
 ## License

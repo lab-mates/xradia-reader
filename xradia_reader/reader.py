@@ -605,6 +605,52 @@ def _build_summary(f: XradiaFile) -> dict:
     return _drop_none(s)
 
 
+#: The few values worth seeing at a glance: (label, summary path).
+KEY_VALUES = [
+    ("kind", "file/kind"),
+    ("software_version", "file/software_version"),
+    ("n_images", "image/n_images"),
+    ("height", "image/height"),
+    ("width", "image/width"),
+    ("dtype", "image/dtype"),
+    ("pixel_size_um", "image/pixel_size_um"),
+    ("voltage_kV", "source/voltage_kV"),
+    ("current_uA", "source/current_uA"),
+    ("power_W", "source/power_W"),
+    ("source_filter", "source/filter"),
+    ("objective", "detector/objective"),
+    ("binning", "detector/binning"),
+    ("source_to_rotation_axis_um", "geometry/source_to_rotation_axis_um"),
+    ("detector_to_rotation_axis_um", "geometry/detector_to_rotation_axis_um"),
+    ("total_magnification", "geometry/total_magnification"),
+    ("exposure_s", "acquisition/exposure_s"),
+    ("acquisition_start", "acquisition/start"),
+    ("acquisition_end", "acquisition/end"),
+    ("n_projections", "reconstruction/n_projections"),
+    ("angle_span_deg", "reconstruction/angle_span_deg"),
+    ("recon_binning", "reconstruction/recon_binning"),
+    ("center_shift_px", "reconstruction/center_shift_px"),
+    ("beam_hardening", "reconstruction/beam_hardening"),
+    ("recon_input_file", "reconstruction/input_file"),
+]
+
+
+def key_values(summary: dict) -> dict:
+    """Flat dict of the most important summary values (see KEY_VALUES).
+    Missing entries are skipped; per-image ranges become 'min .. max'."""
+    out = {}
+    for label, path in KEY_VALUES:
+        v = _get(summary, path)
+        if v is None:
+            continue
+        if isinstance(v, dict) and {"min", "max"} <= set(v):
+            v = f"{v['min']} .. {v['max']}"
+        elif isinstance(v, datetime):
+            v = v.isoformat(sep=" ")
+        out[label] = v
+    return out
+
+
 # ---------------------------------------------------------------------------
 # functional API
 # ---------------------------------------------------------------------------

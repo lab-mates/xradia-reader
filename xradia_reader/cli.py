@@ -2,7 +2,7 @@
 
 ``xradia-info FILE [--json OUT] [--tiff OUT] [--tree] [--grep REGEX]``
     FILE may be an Xradia .txm/.txrm/.xrm or an .h5 archive.
-``xradia-archive FILES... [--out-dir DIR] [--drop-bits N|auto] [--verify-only]``
+``xradia-archive FILES... [--out-dir DIR] [--drop-bits N|auto] [--verify-only] [--upgrade]``
     Compress Xradia files to HDF5 archives (lossless by default).
 """
 from __future__ import annotations
@@ -16,8 +16,8 @@ import numpy as np
 
 from pathlib import Path
 
-from .archive import open_any, verify_hdf5, write_hdf5
-from .reader import XradiaFile, _json_default
+from .archive import open_any, upgrade_archive, verify_hdf5, write_hdf5
+from .reader import XradiaFile, _json_default, key_values
 
 
 def _walk(d, prefix=""):
@@ -52,6 +52,7 @@ def main(argv=None):
     ap.add_argument("--tree", action="store_true", help="list every decoded stream")
     ap.add_argument("--grep", metavar="REGEX", help="only streams whose path matches (implies --tree)")
     ap.add_argument("--no-config", action="store_true", help="hide ConfigureBackup/* in --tree")
+    ap.add_argument("--full", action="store_true", help="print the full summary, not just key values")
     a = ap.parse_args(argv)
 
     with open_any(a.file) as f:
@@ -72,7 +73,11 @@ def main(argv=None):
                 print(f"{path:70s} {_short(v)}")
         elif not (a.json or a.tiff):
             print(repr(f))
-            print(json.dumps(f.summary, indent=2, default=_json_default))
+            if a.full:
+                print(json.dumps(f.summary, indent=2, default=_json_default))
+            else:
+                for k, v in key_values(f.summary).items():
+                    print(f"  {k:30s} {v}")
 
 
 def _mb(n):
@@ -92,7 +97,21 @@ def archive_main(argv=None):
     ap.add_argument("--no-verify", action="store_true", help="skip the read-back check")
     ap.add_argument("--verify-only", action="store_true",
                     help="FILES are existing .h5 archives: re-check their pixel checksums")
+    ap.add_argument("--upgrade", action="store_true",
+                    help="FILES are older .h5 archives: rewrite them in the current layout "
+                         "(pixels copied, not recompressed)")
     a = ap.parse_args(argv)
+
+    if a.upgrade:
+        bad = 0
+        for fn in a.files:
+            dst = Path(a.out_dir) / Path(fn).name if a.out_dir else None
+            r = upgrade_archive(fn, dst, verify=not a.no_verify)
+            ok = r.get("verified", True)
+            bad += not ok
+            state = "upgraded" if r["upgraded"] else "already current"
+            print(f"{'OK  ' if ok else 'FAIL'} {fn}: {state}" + (f" -> {dst}" if dst else ""))
+        sys.exit(1 if bad else 0)
 
     if a.verify_only:
         bad = 0
